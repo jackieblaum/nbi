@@ -1038,10 +1038,32 @@ class NBI:
         with self.tqdm(total=len(self.train_loader.dataset)) as pbar:
             for batch_idx, data in enumerate(self.train_loader):
                 x, y = data
+
+                if not torch.isfinite(x).all(): 
+                    raise ValueError(f"NaN/Inf in raw x @batch {batch_idx}")
+                if not torch.isfinite(y).all(): 
+                    raise ValueError(f"NaN/Inf in raw y @batch {batch_idx}")
+                
                 x = self.scale_x(x).to(self.device, dtype=torch.float32)
                 y = self.scale_y(y).to(self.device, dtype=torch.float32)
+                
+                if not torch.isfinite(x).all():
+                    bad_dims = (~torch.isfinite(x)).any(dim=0).nonzero(as_tuple=True)[0]
+                    raise ValueError(f"Scaling produced NaN/Inf in x @ dims {bad_dims.tolist()}")
+                if not torch.isfinite(y).all():
+                    bad_dims = (~torch.isfinite(y)).any(dim=0).nonzero(as_tuple=True)[0]
+                    raise ValueError(f"Scaling produced NaN/Inf in y @ dims {bad_dims.tolist()}")
+
                 self.optimizer.zero_grad()
                 loss = self.network(x, y)
+
+                if not torch.isfinite(loss).all():
+                    with torch.no_grad():
+                        print("Loss contains non-finite values. Sample stats:",
+                            "x mean/std", x.mean().item(), x.std().item(),
+                            "y mean/std", y.mean().item(), y.std().item())
+                    raise ValueError(f"Non-finite loss @batch {batch_idx}")
+    
                 loss = loss.mean()
                 train_loss.append(loss.item())
                 loss.backward()
