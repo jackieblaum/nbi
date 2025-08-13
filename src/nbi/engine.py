@@ -802,6 +802,7 @@ class NBI:
         -------
 
         """
+        assert self.y_mean is not None and self.y_std is not None
         if back:
             return y * self.y_std + self.y_mean
         else:
@@ -824,6 +825,7 @@ class NBI:
         -------
 
         """
+        assert self.x_mean is not None and self.x_std is not None
         if back:
             return x * self.x_std + self.x_mean
         else:
