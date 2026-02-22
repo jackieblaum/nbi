@@ -21,6 +21,7 @@ from torch.optim.lr_scheduler import (
 
 # this seems to be required for some environments
 from torch.utils.data import DataLoader, dataloader
+from torch.utils.data import Dataset as TorchDataset
 from tqdm import tqdm
 from tqdm.notebook import tqdm as tqdmn
 
@@ -28,6 +29,7 @@ dataloader.multiprocessing = mp
 
 from .data import BaseContainer
 from .model import DataParallelFlow, get_featurizer, get_flow
+from .empirical_prior import EmpiricalPrior
 from .utils import iid_gaussian, log_like_iidg, parallel_simulate
 
 
@@ -388,9 +390,14 @@ class NBI:
             self._init_train(lr)
             self._init_scheduler(min_lr, decay_type=decay_type)
             x_round, y_round = self.get_round_data(n_reuse)
-            data_container = BaseContainer(
-                x_round, y_round, f_test=0, f_val=f_val, process=self.process
-            )
+
+            if isinstance(x_round, TorchDataset) and y_round is None:
+                data_container = DatasetContainer(x_round, f_test=0.0, f_val=f_val, seed=0)
+            else:
+                data_container = BaseContainer(
+                    x_round, y_round, f_test=0, f_val=f_val, process=self.process
+                )
+
             self._init_loader(data_container, batch_size, workers=workers)
 
             for epoch in range(n_epochs):
@@ -900,6 +907,7 @@ class NBI:
         x_path, good = self.simulate(ys)
         x_path = x_path[good]
         ys = ys[good]
+        print(ys)
         weights = self.importance_reweight(x, x_path, ys)
 
         neff = 1 / (weights**2).sum() - 1
@@ -1000,6 +1008,7 @@ class NBI:
             return self.x, masks
         else:
             n = len(thetas)
+            print(thetas)
             paths = np.array(
                 [os.path.join(path_round, str(i) + ".npy") for i in range(n)]
             )
@@ -1023,6 +1032,17 @@ class NBI:
                 masks = p.map(parallel_simulate, jobs)
             masks = np.concatenate(masks)
             return paths, masks
+        
+    def _check_scalers(self):
+        bad_mean = (~np.isfinite(self.x_mean)).any()
+        bad_std  = (~np.isfinite(self.x_std)).any()
+        if bad_mean or bad_std:
+            print("x_mean bad cols:", np.where(~np.isfinite(self.x_mean))[0].tolist())
+            print("x_std  bad cols:", np.where(~np.isfinite(self.x_std))[0].tolist())
+            raise ValueError("Non-finite x_mean/x_std; recompute scalers before training.")
+        if (self.x_std == 0).any():
+            zeros = np.nonzero(self.x_std == 0, as_tuple=False).T[-1].tolist()
+            print("x_std zero cols:", zeros)   
 
     def _train_step(self):
         """
@@ -1032,6 +1052,7 @@ class NBI:
         -------
 
         """
+        self._check_scalers()
         np.random.seed(self.epoch)
         self.network.train()
         train_loss = []
@@ -1270,9 +1291,12 @@ class NBI:
                 return self.y
             else:
                 params = []
-                for prior in self.prior:
-                    params.append(prior.rvs(n))
-                params = np.array(params).T
+                if isinstance(self.prior, EmpiricalPrior):
+                    params = self.prior.rvs(n)
+                else:
+                    for prior in self.prior:
+                        params.append(prior.rvs(n))
+                    params = np.array(params).T
                 return params
         # 2+ round: sample from surrogate posterior
         else:
@@ -1280,7 +1304,9 @@ class NBI:
             logprior = self.log_prior(params)
             if np.isinf(logprior).any():
                 print("Samples outside prior N =", np.isinf(logprior).sum())
+                print('Bad: ', params[np.isinf(logprior)])
                 params = params[~np.isinf(logprior)]
+                print('Good: ', params)
                 while len(params) < n:
                     n_needed = n - len(params)
                     new_params = self.sample(x, n=n)
@@ -1332,6 +1358,8 @@ class NBI:
         """
         if self.prior is None:
             return np.zeros(len(y))
+        elif isinstance(self.prior, EmpiricalPrior):
+            log_prob = self.prior.logpdf(y)
         else:
             log_prob = np.zeros(len(y))
             for i, prior in enumerate(self.prior):
