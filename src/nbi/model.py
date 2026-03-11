@@ -33,8 +33,8 @@ class MultiFeaturizer(nn.Module):
         return torch.cat(feats, dim=1)
 
 class DataParallelFlow(nn.DataParallel):
-    def __init__(self, *args, **kwargs):
-        super(type(self), self).__init__(*args, **kwargs)
+    def __init__(self, module, device_ids=None, output_device=None, dim=0):
+        super().__init__(module, device_ids=device_ids, output_device=output_device, dim=dim)
 
     def sample(self, x, n=1000, is_feature=False):
         if not is_feature:
@@ -46,7 +46,7 @@ class DataParallelFlow(nn.DataParallel):
 
 class Flow(nn.Module):
     def __init__(self, featurizer, model):
-        super(type(self), self).__init__()
+        super().__init__()
         self.featurizer = featurizer
         self.flow = model
 

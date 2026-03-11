@@ -194,8 +194,10 @@ class NBI:
         self.featurizer_config = copy.copy(featurizer)
         self.flow_config = flow_config_all
 
-        self.network = get_flow(featurizer, **flow_config_all)
-        self.network = DataParallelFlow(self.network).to(self.device, dtype=torch.float32)
+        self.network = get_flow(featurizer, **flow_config_all).to(self.device, dtype=torch.float32)
+
+        if "cuda" in self.device and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            self.network = DataParallelFlow(self.network)
 
         self.corner_kwargs.update({"labels": labels})
         self.network_reinit = network_reinit
@@ -279,6 +281,8 @@ class NBI:
         plot=True,
         f_accept_min=-1,
         workers=8,
+        pin_memory=None,
+        prefetch_factor=2,
     ):
         """
         Fit the Neural Bayesian Inference Engine.
@@ -365,6 +369,12 @@ class NBI:
         workers : int, optional
             Number of workers for data loading.
 
+        pin_memory : bool, optional
+            If True, enables pinned memory for data loading. Defaults to True when using CUDA, False otherwise.
+
+        prefetch_factor : int, optional
+            Number of batches prefetched per worker. Default: 2. Ignored when workers=0.
+
         Returns
         -------
 
@@ -408,6 +418,11 @@ class NBI:
             self.prepare_data(x_obs, n_sims)
 
         for i in range(n_rounds):
+            path_round = os.path.join(self.directory, str(self.round))
+            try:
+                os.mkdir(path_round)
+            except:
+                pass
             print(
                 f"\n---------------------- Round: {self.round} ----------------------"
             )
@@ -417,13 +432,13 @@ class NBI:
             x_round, y_round = self.get_round_data(n_reuse)
 
             if isinstance(x_round, TorchDataset) and y_round is None:
-                data_container = DatasetContainer(x_round, f_test=0.0, f_val=f_val, seed=0)
+                data_container = DatasetContainer(x_round, f_test=0.0, f_val=f_val, seed=0, process=self.process)
             else:
                 data_container = BaseContainer(
                     x_round, y_round, f_test=0, f_val=f_val, process=self.process
                 )
 
-            self._init_loader(data_container, batch_size, workers=workers)
+            self._init_loader(data_container, batch_size, workers=workers, pin_memory=pin_memory, prefetch_factor=prefetch_factor)
 
             for epoch in range(n_epochs):
                 self.epoch = epoch
@@ -759,56 +774,72 @@ class NBI:
 
         Parameters
         ----------
-        state_dict : str or state dict
-            State dict or path to saved state dict containing three keys:
-            network_state_dict, x_scale, y_scale
+        state_dict : str or dict
+            State dict or path to saved state dict. Supports both the current format
+            (model_state_dict, x_mean, x_std, y_mean, y_std) and legacy format (x_scale, y_scale).
 
         Returns
         -------
 
         """
-
         if type(state_dict) == str:
-            state_dict = torch.load(
-                state_dict, map_location=self.device, weights_only=False
-            )
-        model_state_dict = state_dict["model_state_dict"]
+            state_dict = torch.load(state_dict, map_location=self.device, weights_only=False)
 
-        # Move x_scale and y_scale to CPU before converting to numpy arrays
-        x_scale = state_dict["x_scale"].cpu().numpy()
-        y_scale = state_dict["y_scale"].cpu().numpy()
+        self.get_network().load_state_dict(state_dict["model_state_dict"])
 
-        self.x_mean = x_scale[0]
-        self.x_std = x_scale[1]
-        self.y_mean = y_scale[0]
-        self.y_std = y_scale[1]
-        self.get_network().load_state_dict(model_state_dict)
+        def to_numpy(obj):
+            if isinstance(obj, torch.Tensor):
+                return obj.detach().cpu().numpy()
+            if isinstance(obj, np.ndarray):
+                return obj
+            if isinstance(obj, (list, tuple)):
+                return [to_numpy(x) for x in obj]
+            if obj is None:
+                return None
+            raise TypeError(f"Unsupported scaler type: {type(obj)}")
+
+        if "x_mean" in state_dict:
+            self.x_mean = to_numpy(state_dict["x_mean"])
+            self.x_std  = to_numpy(state_dict["x_std"])
+            self.y_mean = to_numpy(state_dict["y_mean"])
+            self.y_std  = to_numpy(state_dict["y_std"])
+        else:
+            x_scale = state_dict["x_scale"].cpu().numpy()
+            y_scale = state_dict["y_scale"].cpu().numpy()
+            self.x_mean, self.x_std = x_scale[0], x_scale[1]
+            self.y_mean, self.y_std = y_scale[0], y_scale[1]
+
+        # keep masks if present
+        if "masked_channels" in state_dict:
+            self.masked_channels = state_dict["masked_channels"]
 
     def get_params(self):
         """
         Saves the network weights and pre-processing scales to disk
-
-        Returns
-        -------
-
         """
-        x_scale = np.array([self.x_mean, self.x_std], dtype=np.float32)
-        y_scale = np.array([self.y_mean, self.y_std], dtype=np.float32)
-
-        # Convert numpy arrays to PyTorch tensors
-        x_scale_tensor = torch.from_numpy(x_scale)
-        y_scale_tensor = torch.from_numpy(y_scale)
-
-        # Assuming 'network' is your model
         model_state_dict = copy.deepcopy(self.get_network().state_dict())
 
-        # Create a new dictionary to store model state and additional tensors
+        def to_tensor(obj):
+            # obj can be ndarray, torch tensor, or list/tuple of those
+            if isinstance(obj, torch.Tensor):
+                return obj.detach().cpu()
+            if isinstance(obj, np.ndarray):
+                return torch.from_numpy(obj.astype(np.float32, copy=False))
+            if isinstance(obj, (list, tuple)):
+                return [to_tensor(x) for x in obj]
+            if obj is None:
+                return None
+            raise TypeError(f"Unsupported scaler type: {type(obj)}")
+
         state_dict = {
             "model_state_dict": model_state_dict,
-            "x_scale": x_scale_tensor,
-            "y_scale": y_scale_tensor,
+            "x_mean": to_tensor(self.x_mean),
+            "x_std":  to_tensor(self.x_std),
+            "y_mean": to_tensor(self.y_mean),
+            "y_std":  to_tensor(self.y_std),
             "flow_config": self.flow_config,
             "featurizer_config": self.featurizer_config,
+            "masked_channels": self.masked_channels,
         }
         return state_dict
 
@@ -1021,7 +1052,18 @@ class NBI:
         """
         self.network.eval()
         x = self.scale_x(x)
-        x = torch.from_numpy(x).to(self.device, dtype=torch.float32)
+
+        if isinstance(x, (list, tuple)):
+            x = [
+                (xj if torch.is_tensor(xj) else torch.as_tensor(xj))
+                .to(self.device, dtype=torch.float32)
+                for xj in x
+            ]
+        else:
+            if not torch.is_tensor(x):
+                x = torch.as_tensor(x)
+            x = x.to(self.device, dtype=torch.float32)
+
         with torch.no_grad():
             # GPU memory control (make larger?)
             if n > 20000:
@@ -1353,18 +1395,22 @@ class NBI:
         else:
             self.scheduler.step()
 
-    def _init_loader(self, data_container, batch_size, workers=4):
+    def _init_loader(self, data_container, batch_size, workers=4, pin_memory=None, prefetch_factor=2):
         """
         Initialize data loader.
 
         Parameters
         ----------
-        data_container : DataContainer
+        data_container : BaseContainer or DatasetContainer
             Data container object.
         batch_size : int
             Batch size.
         workers : int, optional
             Number of workers for data loader.
+        pin_memory : bool, optional
+            If True, enables pinned memory for data loading. Defaults to True when using CUDA, False otherwise.
+        prefetch_factor : int, optional
+            Number of batches prefetched per worker. Default: 2. Ignored when workers=0.
 
         Returns
         -------
@@ -1372,13 +1418,20 @@ class NBI:
         """
         train_container, val_container, test_container = data_container.get_splits()
 
+        if pin_memory is None:
+            pin_memory = ("cuda" in str(self.device))
+
         kwargs = {
             "num_workers": workers,
-            "pin_memory": False,
+            "pin_memory": pin_memory,
             "drop_last": True,
             "persistent_workers": True,
+            "prefetch_factor": prefetch_factor if workers > 0 else None,
             "collate_fn": collate_list_channels, 
         }
+        if workers == 0:
+            kwargs.pop("prefetch_factor", None)
+            kwargs["persistent_workers"] = False
 
         self.train_loader = DataLoader(
             train_container, batch_size=batch_size, shuffle=True, **kwargs
@@ -1472,26 +1525,28 @@ class NBI:
                 # concatenate batches along batch dim: [N, C, L]
                 xs = torch.cat([xb[j] for xb in x_batches], dim=0).cpu().numpy()
 
-                cfg = None
-                if self.masked_channels is not None:
-                    cfg = self.masked_channels[j]
+                cfg = self.masked_channels[j] if self.masked_channels is not None else None
+                reduce_axes = (0, 2)
+                if cfg is not None and "reduce_axes" in cfg:
+                    reduce_axes = tuple(cfg["reduce_axes"])
 
                 if cfg is not None:
                     mu, sd = masked_mean_std(
                         xs,
                         mask_dim=cfg["mask_dim"],
                         masked_dims=cfg["masked_dims"],
+                        reduce_axes=reduce_axes
                     )
 
                     if cfg.get("mask_keep_identity", True):
                         md = cfg["mask_dim"]
-                        mu[0, md, 0] = 0.0
-                        sd[0, md, 0] = 1.0
+                        mu[0, md, :] = 0.0
+                        sd[0, md, :] = 1.0
 
                 else:
                     # default unmasked behavior
-                    mu = xs.mean(axis=(0, 2), keepdims=True)
-                    sd = xs.std(axis=(0, 2), keepdims=True)
+                    mu = xs.mean(axis=reduce_axes, keepdims=True)
+                    sd = xs.std(axis=reduce_axes, keepdims=True)
                     sd = np.where(sd == 0, 1.0, sd)
 
                 x_mean.append(mu.astype(np.float32))
