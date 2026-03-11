@@ -6,8 +6,10 @@ warnings.simplefilter("ignore")
 import nbi
 import numpy as np
 import pytest
+import torch
 from scipy.stats import uniform
 from torch import nn
+from torch.utils.data import Dataset
 
 # Common setup variables
 t = np.linspace(0, 1, 50)
@@ -169,6 +171,106 @@ def test_custom_featurizer():
 
     fit_and_predict(engine)
     fit_and_predict_anpe(engine)
+
+
+class MultiChannelSineDataset(Dataset):
+    """Synthetic dataset returning two channels per sample: (sine, cosine)."""
+
+    def __init__(self, n_samples=500, seq_len=50, seed=0):
+        rng = np.random.default_rng(seed)
+        self.t = np.linspace(0, 1, seq_len).astype(np.float32)
+        self.params = np.column_stack([
+            rng.uniform(0, 2 * np.pi, n_samples),   # phi0
+            rng.uniform(1, 5, n_samples),            # A
+            rng.uniform(2 * np.pi, 12 * np.pi, n_samples),  # omega
+        ]).astype(np.float32)
+
+        # Pre-compute both channels
+        self.ch0 = []  # sine channel
+        self.ch1 = []  # cosine channel
+        for phi0, A, omega in self.params:
+            self.ch0.append(A * np.sin(omega * self.t + phi0))
+            self.ch1.append(A * np.cos(omega * self.t + phi0))
+
+    def __len__(self):
+        return len(self.params)
+
+    def __getitem__(self, idx):
+        # Each channel: [1, seq_len]  (C=1 per channel)
+        x0 = torch.tensor(self.ch0[idx][None, :], dtype=torch.float32)
+        x1 = torch.tensor(self.ch1[idx][None, :], dtype=torch.float32)
+        y = torch.tensor(self.params[idx], dtype=torch.float32)
+        return [x0, x1], y
+
+
+def test_multi_modal():
+    """Test multi-channel input with per-channel featurizers and DatasetContainer."""
+    dim_out = 32
+    flow = {
+        "n_dims": 3,
+        "flow_hidden": 32,
+        "num_blocks": 4,
+        "num_cond_inputs": dim_out * 2,
+    }
+
+    featurizer_ch0 = nn.Sequential(
+        nn.Flatten(start_dim=1),
+        nn.Linear(50, 64),
+        nn.ReLU(),
+        nn.Linear(64, dim_out),
+    )
+    featurizer_ch0.num_outputs = dim_out
+
+    featurizer_ch1 = nn.Sequential(
+        nn.Flatten(start_dim=1),
+        nn.Linear(50, 64),
+        nn.ReLU(),
+        nn.Linear(64, dim_out),
+    )
+    featurizer_ch1.num_outputs = dim_out
+
+    dataset = MultiChannelSineDataset(n_samples=500, seq_len=50)
+
+    engine = nbi.NBI(
+        flow=flow,
+        featurizer=[featurizer_ch0, featurizer_ch1],
+        labels=labels,
+        path="test_multimodal",
+        device="cpu",
+    )
+
+    engine.fit(
+        x=dataset,
+        n_sims=-1,
+        n_rounds=1,
+        n_epochs=2,
+        batch_size=32,
+        lr=0.001,
+        min_lr=0.001,
+        workers=0,
+        plot=False,
+    )
+
+    # Build a single observation from both channels
+    y_test = np.array([1.0, 2.0, 6.0], dtype=np.float32)
+    x0_obs = (2.0 * np.sin(6.0 * t + 1.0)).astype(np.float32)[None, :]  # [1, L]
+    x1_obs = (2.0 * np.cos(6.0 * t + 1.0)).astype(np.float32)[None, :]
+    x_obs_multi = [x0_obs, x1_obs]
+
+    samples = engine.predict(x_obs_multi, n_samples=100, seed=0)
+    assert samples.shape == (100, 3)
+
+    # Test save/load round-trip
+    best_params = engine.get_params()
+    engine2 = nbi.NBI(
+        state_dict=best_params,
+        featurizer=[featurizer_ch0, featurizer_ch1],
+        labels=labels,
+        path="test_multimodal2",
+        device="cpu",
+    )
+    samples2 = engine2.predict(x_obs_multi, n_samples=100, seed=0)
+    assert np.allclose(samples, samples2)
 
 
 if __name__ == "__main__":

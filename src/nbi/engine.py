@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import wandb
 from multiprocess import Pool
-from torch import optim
+from torch import nn, optim
 from torch.optim.lr_scheduler import (
     CosineAnnealingWarmRestarts,
     MultiStepLR,
@@ -152,9 +152,12 @@ class NBI:
         self.init_env()
 
         if state_dict is not None:
-            _state_dict = torch.load(
-                state_dict, map_location=self.device, weights_only=False
-            )
+            if isinstance(state_dict, str):
+                _state_dict = torch.load(
+                    state_dict, map_location=self.device, weights_only=False
+                )
+            else:
+                _state_dict = state_dict
             flow_config_all = _state_dict["flow_config"]
             featurizer = (
                 featurizer
@@ -379,8 +382,8 @@ class NBI:
         -------
 
         """
-        # either simulate n_sims or provide pre computed samples
-        assert n_sims > 0 or y is not None
+        # either simulate n_sims, provide pre computed samples, or pass a Dataset
+        assert n_sims > 0 or y is not None or isinstance(x, TorchDataset)
 
         if type(noise) == np.ndarray:
             # for i.i.d. gaussian noise
@@ -1638,8 +1641,8 @@ class NBI:
         x = torch.from_numpy(x).to(self.device, dtype=torch.float32)
         y = torch.from_numpy(y).to(self.device, dtype=torch.float32)
         with torch.no_grad():
-            # it appears that DataParallal doesn't work properly here
-            log_prob = self.network.module(x, y).cpu().numpy()[:, 0] * -1
+            # use get_network() to handle both DataParallel and non-wrapped cases
+            log_prob = self.get_network()(x, y).cpu().numpy()[:, 0] * -1
         return log_prob
 
     def corner(

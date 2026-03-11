@@ -56,16 +56,33 @@ def log_like_iidg(x_err):
 
 def collate_list_channels(batch):
     """
-    Batch is a list of tuples: [(x_list, y), ...]
-    where x_list is list of tensors: [x0, x1, ..., xK]
-    Returns:
-    x_batched: list of tensors, each stacked to [B, ...]
-    y_batched: tensor [B, D]
+    Custom collate function that supports both single-tensor and multi-channel inputs.
+
+    For multi-channel data, batch is a list of tuples: [(x_list, y), ...]
+    where x_list is a list/tuple of tensors, one per channel: [x0, x1, ..., xK].
+
+    For single-tensor data, batch is a list of tuples: [(x, y), ...]
+    where x is a tensor or ndarray.
+
+    Returns
+    -------
+    x_batched : list of tensors (multi-channel) or single tensor (single-channel)
+        Each channel stacked to [B, ...], or a single stacked tensor [B, ...].
+    y_batched : tensor [B, D]
     """
-    xs, ys = zip(*batch)  # xs is tuple of lists
-    k = len(xs[0])
-    x_out = [torch.stack([x_i[j] for x_i in xs], dim=0) for j in range(k)]
-    y_out = torch.stack(list(ys), dim=0)
+    xs, ys = zip(*batch)
+
+    # Convert y to tensors
+    y_out = torch.stack([torch.as_tensor(y) for y in ys], dim=0)
+
+    # Multi-channel: x is a list/tuple of tensors
+    if isinstance(xs[0], (list, tuple)):
+        k = len(xs[0])
+        x_out = [torch.stack([torch.as_tensor(x_i[j]) for x_i in xs], dim=0) for j in range(k)]
+    else:
+        # Single tensor/ndarray
+        x_out = torch.stack([torch.as_tensor(x) for x in xs], dim=0)
+
     return x_out, y_out
 
 
