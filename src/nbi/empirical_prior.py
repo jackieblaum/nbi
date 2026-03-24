@@ -19,6 +19,14 @@ class EmpiricalPrior:
     def logpdf(self, params):
         if self.priors is None:
             raise NotImplementedError(
-                "logp not implemented: provide a prior model or override this method."
+                "logpdf not implemented: provide a `priors` argument (a list of "
+                "scipy-style distributions or a single object with a .logpdf method) "
+                "to enable log-probability evaluation, which is required for SNPE."
             )
+        params = np.asarray(params)
+        if isinstance(self.priors, list):
+            log_prob = np.zeros(len(params))
+            for i, prior in enumerate(self.priors):
+                log_prob += prior.logpdf(params[:, i])
+            return log_prob
         return self.priors.logpdf(params)

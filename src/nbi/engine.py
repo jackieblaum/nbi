@@ -32,6 +32,14 @@ from .model import DataParallelFlow, get_featurizer, get_flow
 from .empirical_prior import EmpiricalPrior
 from .utils import iid_gaussian, log_like_iidg, parallel_simulate, collate_list_channels, masked_mean_std
 
+
+def _worker_init_fn(worker_id):
+    """Prevent numpy/BLAS thread oversubscription in DataLoader workers."""
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
+
 class NBI:
     """Neural Bayesian Inference Engine.
 
@@ -689,8 +697,11 @@ class NBI:
         bad = np.isnan(log_weights) + np.isinf(log_weights)
         valid_weights = log_weights[~bad]
         if len(valid_weights) == 0:
-            print("All log weights are NaN or Inf — skipping this round!")
-            return np.zeros_like(log_weights)
+            raise ValueError(
+                "All importance weights are invalid (NaN or Inf). "
+                "This typically means the prior, likelihood, or proposal "
+                "returned degenerate values for every sample."
+            )
         log_weights -= log_weights[~bad].max()
 
         weights = np.exp(log_weights)
@@ -1430,15 +1441,30 @@ class NBI:
             "drop_last": True,
             "persistent_workers": True,
             "prefetch_factor": prefetch_factor if workers > 0 else None,
-            "collate_fn": collate_list_channels, 
+            "collate_fn": collate_list_channels,
+            "worker_init_fn": _worker_init_fn,
         }
         if workers == 0:
             kwargs.pop("prefetch_factor", None)
             kwargs["persistent_workers"] = False
 
-        self.train_loader = DataLoader(
-            train_container, batch_size=batch_size, shuffle=True, **kwargs
-        )
+        # Use ShardGroupedSampler when the underlying dataset supports it,
+        # to minimise shard-switch overhead with mmap-backed .npy shards.
+        train_sampler = None
+        try:
+            from ebsbi.shards import ShardGroupedSampler
+            train_sampler = ShardGroupedSampler(train_container)
+        except (ImportError, TypeError):
+            pass
+
+        if train_sampler is not None:
+            self.train_loader = DataLoader(
+                train_container, batch_size=batch_size, sampler=train_sampler, **kwargs
+            )
+        else:
+            self.train_loader = DataLoader(
+                train_container, batch_size=batch_size, shuffle=True, **kwargs
+            )
         self.valid_loader = DataLoader(val_container, batch_size=batch_size, **kwargs)
 
         # if self.network_reinit or self.round == 0:
