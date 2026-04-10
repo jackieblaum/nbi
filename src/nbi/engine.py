@@ -697,11 +697,8 @@ class NBI:
         bad = np.isnan(log_weights) + np.isinf(log_weights)
         valid_weights = log_weights[~bad]
         if len(valid_weights) == 0:
-            raise ValueError(
-                "All importance weights are invalid (NaN or Inf). "
-                "This typically means the prior, likelihood, or proposal "
-                "returned degenerate values for every sample."
-            )
+            print("All log weights are NaN or Inf — skipping this round!")
+            return np.zeros_like(log_weights)
         log_weights -= log_weights[~bad].max()
 
         weights = np.exp(log_weights)

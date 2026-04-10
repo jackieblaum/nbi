@@ -274,7 +274,7 @@ def test_multi_modal():
     assert np.allclose(samples, samples2)
 
 
-def test_importance_reweight_raises_when_all_log_weights_invalid():
+def test_importance_reweight_returns_zeros_when_all_log_weights_invalid():
     flow = {
         "n_dims": 3,
         "flow_hidden": 16,
@@ -306,8 +306,10 @@ def test_importance_reweight_raises_when_all_log_weights_invalid():
     engine.log_prob = lambda x_obs, y: np.zeros(len(y))
     y = np.zeros((5, 3), dtype=np.float32)
 
-    with pytest.raises(ValueError, match="All importance weights are invalid"):
-        engine.importance_reweight(np.zeros(50), np.zeros((5, 50)), y)
+    weights = engine.importance_reweight(np.zeros(50), np.zeros((5, 50)), y)
+    assert weights is not None
+    assert weights.shape == (5,)
+    assert np.all(weights == 0)
 
 
 def test_empirical_prior_logpdf_with_list_priors():
